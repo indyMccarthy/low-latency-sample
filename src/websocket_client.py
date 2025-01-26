@@ -2,13 +2,21 @@ import websockets
 import asyncio
 import json
 import socket
+import time
+import random
 
 
 class HyperliquidClient:
     def __init__(self, logger):
         self.logger = logger
-        self.websocket: websockets.WebSocketClientProtocol
+        self.websocket = None
         self.stop_event = asyncio.Event()
+        self.reconnect_delay = 1  # Start with 1 second delay
+        self.max_reconnect_delay = 60  # Maximum delay between reconnection attempts
+        self.connection_attempts = 0
+        self.max_connection_attempts = 1000000  # Practically infinite
+        self.last_message_time = time.time()
+        self.heartbeat_interval = 30  # seconds
 
     def configure_socket(self, sock):
         """Configure socket for low latency"""
@@ -30,19 +38,60 @@ class HyperliquidClient:
             self.logger.warning(f"Failed to configure socket: {e}")
 
     async def connect(self):
+        while self.connection_attempts < self.max_connection_attempts and not self.stop_event.is_set():
+            try:
+                self.websocket = await websockets.connect(
+                    "wss://api.hyperliquid.xyz/ws",
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=10,
+                    max_size=2**23,  # 8MB max message size
+                    compression=None,  # Disable compression for lower latency
+                )
+
+                # Get the underlying socket and configure it
+                ws_socket = self.websocket.transport.get_extra_info("socket")
+                self.configure_socket(ws_socket)
+
+                self.connection_attempts = 0  # Reset counter on successful connection
+                self.reconnect_delay = 1  # Reset delay
+                self.logger.info("Connected to WebSocket")
+
+                # Start heartbeat monitoring
+                asyncio.create_task(self._monitor_connection())
+                return True
+
+            except Exception as e:
+                self.logger.error(f"WebSocket connection failed: {e}")
+                self.connection_attempts += 1
+
+                # Exponential backoff with jitter
+                jitter = random.uniform(0, 0.1) * self.reconnect_delay
+                await asyncio.sleep(self.reconnect_delay + jitter)
+                self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
+
+        return False
+
+    async def _monitor_connection(self):
+        """Monitor connection health and reconnect if needed"""
+        while not self.stop_event.is_set():
+            try:
+                if time.time() - self.last_message_time > self.heartbeat_interval * 2:
+                    self.logger.warning("Connection seems dead, initiating reconnect...")
+                    await self.reconnect()
+                await asyncio.sleep(5)
+            except Exception as e:
+                self.logger.error(f"Error in connection monitor: {e}")
+
+    async def reconnect(self):
+        """Handle reconnection and resubscription"""
         try:
-            self.websocket = await websockets.connect("wss://api.hyperliquid.xyz/ws")
-
-            # Get the underlying socket and configure it
-            ws_socket = self.websocket.transport.get_extra_info("socket")
-            self.configure_socket(ws_socket)
-
-            print("Connected to WebSocket")
-            asyncio.create_task(self._send_periodic_ping())
-            return True
+            await self.websocket.close()
         except Exception as e:
-            self.logger.error(f"WebSocket connection failed: {e}")
-            return False
+            self.logger.error(f"Error closing WebSocket: {e}")
+
+        if await self.connect():
+            await self.subscribe("BTC")  # Resubscribe to feeds
 
     async def _send_periodic_ping(self):
         ping_msg = {"method": "ping"}
