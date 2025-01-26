@@ -1,0 +1,6 @@
+websockets>=11.0.3
+loguru>=0.7.0
+orjson>=3.9.10
+numpy==1.24.3
+psutil>=5.9.0
+Cython==3.0.8 
