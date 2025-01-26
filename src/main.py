@@ -12,6 +12,9 @@ import platform
 import orjson
 import numpy as np
 from src.optimized_metrics import calculate_ofi_cy, simulate_slippage_cy
+import signal
+import threading
+from datetime import datetime
 
 from orderbook_metrics import calculate_ofi, calculate_spread, simulate_slippage
 
@@ -45,7 +48,7 @@ logger.add(sys.stderr, level="INFO")
 
 
 # WebSocket server: listens for messages, processes data, and adds to the deque
-async def websocket_handler(websocket, shutdown_event):
+async def websocket_handler(websocket, shutdown_event, metrics_store):
     logger.info("Client connected.")
     try:
         while not shutdown_event.is_set():
@@ -64,6 +67,10 @@ async def websocket_handler(websocket, shutdown_event):
                 end_time = time.perf_counter_ns()
                 processing_time = (end_time - start_time) / 1000
                 logger.info(f"Message processed in {processing_time:.4f} microseconds")
+
+                # Update metrics
+                metrics_store["last_processed_time"] = time.time()
+                metrics_store["processed_count"] += 1
             except asyncio.TimeoutError:
                 continue
     except websockets.exceptions.ConnectionClosed:
@@ -162,50 +169,151 @@ async def queue_consumer(shutdown_event):
             await asyncio.sleep(0)
 
 
+# Watchdog timer to detect hangs
+class WatchdogTimer:
+    def __init__(self, timeout, handler):
+        self.timeout = timeout
+        self.handler = handler
+        self.timer = None
+        self.last_reset = time.time()
+
+    def reset(self):
+        self.last_reset = time.time()
+        if self.timer:
+            self.timer.cancel()
+        self.timer = threading.Timer(self.timeout, self.handler)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def stop(self):
+        if self.timer:
+            self.timer.cancel()
+
+
+def watchdog_handler():
+    logger.critical("Watchdog timeout - process hanging!")
+    os._exit(1)  # Force exit the process
+
+
 # Main entry point: Start the WebSocket server and the consumer
 async def main():
-    # Create shutdown event within the main function
+    # Initialize watchdog
+    watchdog = WatchdogTimer(60, watchdog_handler)
+
+    # Create shutdown event
     shutdown_event = asyncio.Event()
 
-    client = HyperliquidClient(logger)
+    # Set up signal handlers with access to shutdown_event
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}")
+        shutdown_event.set()  # Signal all tasks to stop
+        sys.exit(0)  # Force exit if needed
 
-    # Connect to WebSocket
-    if not await client.connect():
-        logger.error("Failed to connect to WebSocket")
-        return False
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
 
-    # Subscribe to feeds
-    if not await client.subscribe("BTC"):
-        logger.error("Failed to subscribe to feeds")
-        await client.close()
-        return False
-
-    # Create tasks with shutdown_event parameter
-    processor = asyncio.create_task(websocket_handler(client.websocket, shutdown_event))
-    printer = asyncio.create_task(queue_consumer(shutdown_event))
-
-    logger.info("Starting tasks...")
+    # Initialize metrics storage
+    metrics_store = {"last_processed_time": time.time(), "processed_count": 0, "error_count": 0}
 
     try:
-        # Wait for shutdown event
-        await shutdown_event.wait()
-        logger.info("Shutdown signal received, cleaning up...")
-    except Exception as e:
-        logger.error(f"Error in tasks: {e}")
-    finally:
-        # Clean up tasks if they're still running
-        for task in [processor, printer]:
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        await client.close()
+        client = None
+        tasks = []
 
-    logger.info("Shutdown complete")
+        while not shutdown_event.is_set():  # Check shutdown event in main loop
+            try:
+                client = HyperliquidClient(logger)
+
+                # Connect to WebSocket
+                if not await client.connect():
+                    logger.error("Failed to connect to WebSocket")
+                    await asyncio.sleep(5)
+                    continue
+
+                # Subscribe to feeds
+                if not await client.subscribe("BTC"):
+                    logger.error("Failed to subscribe to feeds")
+                    await client.close()
+                    await asyncio.sleep(5)
+                    continue
+
+                # Create tasks
+                tasks = [
+                    asyncio.create_task(websocket_handler(client.websocket, shutdown_event, metrics_store)),
+                    asyncio.create_task(queue_consumer(shutdown_event)),
+                    asyncio.create_task(monitor_health(metrics_store, shutdown_event)),
+                ]
+
+                # Wait for either shutdown event or task completion
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+                if shutdown_event.is_set():
+                    break
+
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                await asyncio.sleep(5)
+
+    except Exception as e:
+        logger.critical(f"Critical error in main: {e}")
+    finally:
+        # Clean up
+        if tasks:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        if client:
+            await client.close()
+
+        watchdog.stop()
+        logger.info("Shutdown complete")
+
+
+# Health monitoring task
+async def monitor_health(metrics_store, shutdown_event):
+    while not shutdown_event.is_set():
+        try:
+            # Check processing health
+            if time.time() - metrics_store["last_processed_time"] > 60:
+                logger.warning("No messages processed in last 60 seconds!")
+
+            # Log memory usage
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            logger.info(f"Memory usage: {memory_info.rss / 1024 / 1024:.2f} MB")
+
+            # Log metrics
+            logger.info(f"Processed: {metrics_store['processed_count']}, " f"Errors: {metrics_store['error_count']}")
+
+            # Rotate log files if needed
+            current_time = datetime.now()
+            if current_time.hour == 0 and current_time.minute == 0:
+                logger.add(f"logs/log_{current_time.strftime('%Y%m%d')}.log", rotation="1 day")
+
+        except Exception as e:
+            logger.error(f"Error in health monitor: {e}")
+
+        await asyncio.sleep(60)
 
 
 if __name__ == "__main__":
-    # Set up and run the asyncio event loop with uvloop enabled
-    asyncio.run(main())
+    try:
+        # Enable uvloop for better performance
+        import uvloop
+
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except ImportError:
+        pass
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt, shutting down...")
+        sys.exit(0)  # Force exit if needed
+    except Exception as e:
+        logger.critical(f"Critical error in program: {e}")
+        sys.exit(1)
